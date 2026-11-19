@@ -1,0 +1,464 @@
+import { useEffect, useMemo, useRef } from 'react'
+
+import { useRuntimeConfig } from '@/hooks/use-clash'
+import { useGroupsDelays } from '@/hooks/use-group-delays'
+import { useVerge } from '@/hooks/use-verge'
+import { useAppRefreshers, useProxiesData } from '@/providers/app-data-context'
+import delayManager, { type DelaySnapshot } from '@/services/delay'
+import {
+  findCurrentGroupMember,
+  isInteractableMember,
+  resolveMember,
+  selectGlobalChainNodes,
+  selectRuleChainMembers,
+  type ProxyGroupView,
+  type ProxyViewV1,
+  type ResolvedProxyMember,
+} from '@/types/proxy-view'
+import { debugLog } from '@/utils/debug'
+
+import { filterSort, isDelayFilter } from './use-filter-sort'
+import {
+  DEFAULT_STATE,
+  useHeadStateNew,
+  type HeadState,
+} from './use-head-state'
+import { useWindowWidth } from './use-window-width'
+
+export interface ResolvedMemberOccurrence {
+  memberIndex: number
+  member: ResolvedProxyMember
+}
+
+type ProxyGroup = ProxyGroupView
+
+export interface IRenderItem {
+  type: 0 | 1 | 2 | 3 | 4
+  key: string
+  group: ProxyGroup
+  member?: ResolvedMemberOccurrence
+  memberCol?: ResolvedMemberOccurrence[]
+  col?: number
+  headState?: HeadState
+  icon?: string
+  testUrl?: string
+}
+
+/**
+ * Whether the list about to be drawn contains anything a user would call content.
+ *
+ * Derived from the list itself rather than predicted beside it. The prediction that used to
+ * live in the empty-state model asked a different question in chain mode — whether any
+ * Selector or URLTest group existed — which is unrelated to what the chain list is actually
+ * built from, so both a false "empty" and a false "not empty" were reachable.
+ *
+ * A group header alone counts only when the group is visible; every other row is content by
+ * definition, including the members of a group that is hidden but expanded.
+ */
+export const hasRenderableItems = (
+  renderList: readonly IRenderItem[],
+): boolean => renderList.some((item) => item.type !== 0 || !item.group.hidden)
+
+type GroupCache = {
+  group: ProxyGroupView
+  headState: HeadState
+  col: number
+  latencyTimeout: number | undefined
+  /// This group's own delays. Compared by identity so that a test settling in one group
+  /// does not throw away every other group's sorted order.
+  delays: DelaySnapshot | undefined
+  occurrences: ResolvedMemberOccurrence[] | undefined
+  projected: ResolvedMemberOccurrence[] | undefined
+  items: IRenderItem[]
+}
+
+type RuntimeConfigWithProxySequence = IConfigData & { proxies?: unknown }
+
+const resolveOccurrences = (view: ProxyViewV1, group: ProxyGroupView) =>
+  group.members.map((member, memberIndex) => ({
+    memberIndex,
+    member: resolveMember(view, member),
+  }))
+
+const memberKey = (
+  group: ProxyGroupView,
+  occurrence: ResolvedMemberOccurrence,
+) => {
+  const { memberIndex, member } = occurrence
+  const identity =
+    member.kind === 'node' ? member.node.recordId : member.ref.name
+  return `${group.name}:${memberIndex}:${identity}`
+}
+
+const calculateColumns = (width: number, configCol: number): number => {
+  if (configCol > 0 && configCol < 6) return configCol
+  if (width > 1920) return 5
+  if (width > 1450) return 4
+  if (width > 1024) return 3
+  if (width >= 600) return 2
+  return 1
+}
+
+const groupOccurrences = <T>(list: T[], size: number): T[][] =>
+  list.reduce<T[][]>((acc, item) => {
+    const lastGroup = acc[acc.length - 1]
+    if (!lastGroup || lastGroup.length >= size) acc.push([item])
+    else lastGroup.push(item)
+    return acc
+  }, [])
+
+const CHAIN_DELAY_GROUP = 'chain-mode'
+
+const virtualGroup = (members: ProxyGroupView['members']): ProxyGroupView => ({
+  name: CHAIN_DELAY_GROUP,
+  type: 'Selector',
+  udp: false,
+  xudp: false,
+  tfo: false,
+  mptcp: false,
+  smux: false,
+  history: [],
+  members,
+})
+
+export const useRenderList = (
+  mode: string,
+  isChainMode?: boolean,
+  selectedGroup?: string | null,
+) => {
+  const { proxyView } = useProxiesData()
+  const { refreshProxy } = useAppRefreshers()
+  const { verge } = useVerge()
+  const { width } = useWindowWidth()
+  const [headStates, setHeadState] = useHeadStateNew()
+  const latencyTimeout = verge?.default_latency_timeout
+  const { data: runtimeConfig } = useRuntimeConfig(!!isChainMode)
+  const runtimeProxies = (
+    runtimeConfig as RuntimeConfigWithProxySequence | null
+  )?.proxies
+
+  const col = useMemo(
+    () => calculateColumns(width, verge?.proxy_layout_column || 6),
+    [width, verge?.proxy_layout_column],
+  )
+
+  const chainOccurrences = useMemo(() => {
+    if (!proxyView || !isChainMode) return []
+    if (mode === 'rule' && selectedGroup) {
+      return selectRuleChainMembers(proxyView, selectedGroup)
+    }
+    if (!runtimeConfig) return []
+    return selectGlobalChainNodes(proxyView, runtimeProxies).map(
+      (node, memberIndex) => ({
+        memberIndex,
+        member: {
+          kind: 'node' as const,
+          ref: {
+            kind: 'node' as const,
+            name: node.name,
+            recordId: node.recordId,
+          },
+          node,
+        },
+      }),
+    )
+  }, [
+    isChainMode,
+    mode,
+    proxyView,
+    runtimeConfig,
+    runtimeProxies,
+    selectedGroup,
+  ])
+
+  const chainOccurrencesRef = useRef(chainOccurrences)
+  chainOccurrencesRef.current = chainOccurrences
+  const chainDelayGroup =
+    mode === 'rule' && selectedGroup ? selectedGroup : CHAIN_DELAY_GROUP
+  const chainDelayKey = chainOccurrences
+    .map(({ member }) => {
+      if (member.kind !== 'node') return `${member.kind}:${member.ref.name}`
+      const source = member.node.source
+      return source.kind === 'provider'
+        ? `provider:${source.providerName}:${source.proxyName}`
+        : `core:${source.proxyName}`
+    })
+    .join('\u0000')
+
+  useEffect(() => {
+    if (!isChainMode || !chainDelayKey) return
+    const interactable = chainOccurrencesRef.current
+      .map(({ member }) => member)
+      .filter(isInteractableMember)
+    if (interactable.length === 0) return
+
+    const handle = setTimeout(() => {
+      const timeout = verge?.default_latency_timeout || 10000
+      debugLog(`[ChainMode] 开始计算 ${interactable.length} 个节点的延迟`)
+      void delayManager.checkListDelay(interactable, chainDelayGroup, timeout)
+    }, 100)
+
+    return () => {
+      clearTimeout(handle)
+    }
+  }, [
+    chainDelayGroup,
+    chainDelayKey,
+    isChainMode,
+    verge?.default_latency_timeout,
+  ])
+
+  const renderGroups = useMemo(() => {
+    if (!proxyView) return []
+    // A profile whose only group is GLOBAL (mihomo then skips its built-in one)
+    // or that has no proxy-groups has nothing else to show in rule mode.
+    if (mode === 'rule') {
+      return proxyView.groups.length || !proxyView.global
+        ? proxyView.groups
+        : [proxyView.global]
+    }
+    const { global } = proxyView
+    if (!global) return []
+    const current = findCurrentGroupMember(proxyView, global)?.member
+    return current?.kind === 'group' ? [global, current.group] : [global]
+  }, [mode, proxyView])
+
+  const repeatedNameGroups = useMemo(() => {
+    const repeated = new Set<string>()
+    if (isChainMode) return repeated
+    for (const group of renderGroups) {
+      const names = new Set<string>()
+      if (
+        group.members.some(({ name }) => {
+          if (names.has(name)) return true
+          names.add(name)
+          return false
+        })
+      ) {
+        repeated.add(group.name)
+      }
+    }
+    return repeated
+  }, [isChainMode, renderGroups])
+
+  // Rows own delay updates unless repeated names share the current item listener.
+  const renderedGroupNames = useMemo(() => {
+    if (!proxyView || isChainMode) return []
+    return renderGroups
+      .filter((group) => {
+        const state = headStates[group.name] || DEFAULT_STATE
+        return (
+          (state.open || group === proxyView.global) &&
+          (state.sortType === 1 ||
+            isDelayFilter(state.filterText) ||
+            repeatedNameGroups.has(group.name))
+        )
+      })
+      .map(({ name }) => name)
+  }, [headStates, isChainMode, proxyView, renderGroups, repeatedNameGroups])
+  const groupDelays = useGroupsDelays(renderedGroupNames)
+
+  const groupCacheRef = useRef<Map<string, GroupCache> | null>(null)
+  const cachedViewRef = useRef(proxyView)
+  const prevListRef = useRef<IRenderItem[]>([])
+  const prevGroupItemsRef = useRef<IRenderItem[][]>([])
+  const prevModeRef = useRef(mode)
+
+  const renderList = useMemo<IRenderItem[]>(() => {
+    const cache = (groupCacheRef.current ??= new Map())
+    if (cachedViewRef.current !== proxyView) {
+      cache.clear()
+      prevGroupItemsRef.current = []
+      prevListRef.current = []
+      cachedViewRef.current = proxyView
+    }
+    if (!proxyView) return []
+
+    if (isChainMode) {
+      const selected =
+        mode === 'rule'
+          ? proxyView.groups.find(({ name }) => name === selectedGroup)
+          : undefined
+      const group = selected ?? virtualGroup([])
+      const occurrences = filterSort(
+        chainOccurrences,
+        selected?.name ?? CHAIN_DELAY_GROUP,
+        '',
+        0,
+        latencyTimeout!,
+      )
+      if (col > 1) {
+        return groupOccurrences(occurrences, col).map((memberCol) => ({
+          type: 4,
+          key: `chain-col:${memberKey(group, memberCol[0])}`,
+          group,
+          headState: DEFAULT_STATE,
+          col,
+          memberCol,
+        }))
+      }
+      return occurrences.map((member) => ({
+        type: 2,
+        key: `chain:${memberKey(group, member)}`,
+        group,
+        member,
+        headState: DEFAULT_STATE,
+      }))
+    }
+
+    const groupItems = renderGroups.map((group) => {
+      const isFlat = group === proxyView.global
+      const headState = headStates[group.name] || DEFAULT_STATE
+      const cached = cache.get(group.name)
+      if (
+        cached &&
+        cached.group === group &&
+        cached.headState === headState &&
+        cached.col === col &&
+        cached.latencyTimeout === latencyTimeout &&
+        cached.delays === groupDelays.get(group.name)
+      ) {
+        return cached.items
+      }
+
+      // Duplicate names share one item listener until the delay-store fix lands.
+      const refreshRepeated =
+        repeatedNameGroups.has(group.name) &&
+        cached?.delays !== groupDelays.get(group.name)
+      let resolved =
+        cached?.group === group && !refreshRepeated
+          ? cached.occurrences
+          : undefined
+      let projected: ResolvedMemberOccurrence[] | undefined
+      if (headState.open || isFlat) {
+        resolved ??= resolveOccurrences(proxyView, group)
+        projected = filterSort(
+          resolved,
+          group.name,
+          headState.filterText,
+          headState.sortType,
+          latencyTimeout!,
+          {
+            matchCase: headState.filterMatchCase,
+            matchWholeWord: headState.filterMatchWholeWord,
+            useRegularExpression: headState.filterUseRegularExpression,
+          },
+        )
+        // Repeated names still need new member props while item listeners share a key.
+        if (
+          !refreshRepeated &&
+          cached?.group === group &&
+          cached.headState === headState &&
+          cached.col === col &&
+          cached.projected?.length === projected.length &&
+          projected.every(
+            (member, index) => member === cached.projected?.[index],
+          )
+        ) {
+          cache.set(group.name, {
+            ...cached,
+            latencyTimeout,
+            delays: groupDelays.get(group.name),
+          })
+          return cached.items
+        }
+      } else {
+        resolved = undefined
+      }
+
+      const ret: IRenderItem[] = [
+        isFlat
+          ? { type: 1, key: `head-${group.name}`, group, headState }
+          : {
+              type: 0,
+              key: group.name,
+              group,
+              headState,
+              icon: group.icon!,
+              testUrl: group.testUrl!,
+            },
+      ]
+      if (projected) {
+        const occurrences = projected
+        if (occurrences.length === 0) {
+          ret.push({ type: 3, key: `empty-${group.name}`, group, headState })
+        } else if (col > 1) {
+          ret.push(
+            ...groupOccurrences(occurrences, col).map((memberCol) => ({
+              type: 4 as const,
+              key: `col:${memberKey(group, memberCol[0])}`,
+              group,
+              headState,
+              col,
+              memberCol,
+            })),
+          )
+        } else {
+          ret.push(
+            ...occurrences.map((member) => ({
+              type: 2 as const,
+              key: memberKey(group, member),
+              group,
+              member,
+              headState,
+            })),
+          )
+        }
+      }
+
+      cache.set(group.name, {
+        group,
+        headState,
+        col,
+        latencyTimeout: latencyTimeout!,
+        delays: groupDelays.get(group.name),
+        occurrences: resolved,
+        projected,
+        items: ret,
+      })
+      return ret
+    })
+
+    if (
+      prevModeRef.current === mode &&
+      prevGroupItemsRef.current.length === groupItems.length &&
+      groupItems.every(
+        (items, index) => items === prevGroupItemsRef.current[index],
+      )
+    ) {
+      return prevListRef.current
+    }
+    prevModeRef.current = mode
+    prevGroupItemsRef.current = groupItems
+    const retList = groupItems.flat()
+    const filtered =
+      mode === 'rule' ? retList.filter((item) => !item.group.hidden) : retList
+    if (
+      prevListRef.current.length === filtered.length &&
+      filtered.every((item, index) => item === prevListRef.current[index])
+    ) {
+      return prevListRef.current
+    }
+    prevListRef.current = filtered
+    return filtered
+  }, [
+    chainOccurrences,
+    col,
+    groupDelays,
+    headStates,
+    isChainMode,
+    latencyTimeout,
+    mode,
+    proxyView,
+    renderGroups,
+    repeatedNameGroups,
+    selectedGroup,
+  ])
+
+  return {
+    renderList,
+    onProxies: refreshProxy,
+    onHeadState: setHeadState,
+    currentColumns: col,
+  }
+}
