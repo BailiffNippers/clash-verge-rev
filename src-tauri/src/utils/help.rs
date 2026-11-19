@@ -1,0 +1,439 @@
+use crate::core::notify::NoticeStatus;
+use crate::{config::with_encryption, process::AsyncHandler};
+use anyhow::{Context as _, Result, anyhow, bail};
+use clash_verge_logging::{Type, logging};
+use nanoid::nanoid;
+use serde::{Serialize, de::DeserializeOwned};
+use serde_yaml_ng::{Mapping, Value};
+use std::{
+    mem::DropGuard,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
+use tokio::io::AsyncWriteExt as _;
+
+pub async fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+        bail!("file not found \"{}\"", path.display());
+    }
+
+    let yaml_str = tokio::fs::read_to_string(path)
+        .await
+        .with_context(|| format!("failed to read YAML file {}", path.display()))?;
+
+    with_encryption(|| async { serde_yaml_ng::from_str::<T>(&yaml_str) })
+        .await
+        .with_context(|| format!("failed to parse YAML file {}", path.display()))
+}
+
+pub async fn read_mapping(path: &Path) -> Result<Mapping> {
+    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+        bail!("file not found \"{}\"", path.display());
+    }
+
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("failed to read the file \"{}\"", path.display()))?;
+    let yaml_str =
+        String::from_utf8(bytes).with_context(|| format!("failed to read the file \"{}\"", path.display()))?;
+    let label = path.to_path_buf();
+
+    // Parsing a multi-megabyte profile is pure CPU; keep it off the async worker.
+    AsyncHandler::spawn_blocking(move || parse_mapping(yaml_str, label))
+        .await
+        .map_err(|join| anyhow!("yaml parse task failed: {join}"))?
+}
+
+fn parse_mapping(yaml_str: String, path: PathBuf) -> Result<Mapping> {
+    match parse_short_id_text(&yaml_str, &path) {
+        Ok(mut val) => {
+            val.apply_merge()
+                .with_context(|| format!("failed to apply merge \"{}\"", path.display()))?;
+
+            match val {
+                Value::Mapping(map) => Ok(map),
+                _ => Err(anyhow!("failed to transform to yaml mapping \"{}\"", path.display())),
+            }
+        }
+        Err(err) => {
+            let error_msg = format!("YAML syntax error in {}: {}", path.display(), err);
+            logging!(error, Type::Config, "{}", error_msg);
+
+            crate::core::handle::Handle::notice(NoticeStatus::ConfigValidateYamlSyntaxError, error_msg.as_str());
+
+            bail!("YAML syntax error: {}", err)
+        }
+    }
+}
+
+/// A float like `1234e123` loses its hex text, so retry with short-ids quoted and keep that only if nothing else changed.
+fn parse_short_id_text(yaml: &str, path: &Path) -> serde_yaml_ng::Result<Value> {
+    let value = serde_yaml_ng::from_str::<Value>(yaml)?;
+    if !has_numeric_short_id(&value) {
+        return Ok(value);
+    }
+    match serde_yaml_ng::from_str::<Value>(&quote_short_ids(yaml)) {
+        Ok(quoted) if same_except_short_id(&value, &quoted) => Ok(quoted),
+        _ => {
+            logging!(warn, Type::Config, "kept numeric short-id in {}", path.display());
+            Ok(value)
+        }
+    }
+}
+
+fn quote_short_ids(yaml: &str) -> String {
+    let mut quoted = String::with_capacity(yaml.len());
+    let mut rest = yaml;
+    while let Some((head, tail)) = rest.split_once("short-id:") {
+        let (gap, value) = tail.split_at(tail.len() - tail.trim_start_matches([' ', '\t']).len());
+        let (id, after) = value.split_at(value.bytes().take_while(u8::is_ascii_hexdigit).count());
+        quoted.push_str(head);
+        quoted.push_str("short-id:");
+        quoted.push_str(gap);
+        if !id.is_empty() && (after.is_empty() || after.starts_with([' ', '\t', '\r', '\n', ',', '}'])) {
+            quoted.push('"');
+            quoted.push_str(id);
+            quoted.push('"');
+        } else {
+            quoted.push_str(id);
+        }
+        rest = after;
+    }
+    quoted.push_str(rest);
+    quoted
+}
+
+fn has_numeric_short_id(value: &Value) -> bool {
+    match value {
+        Value::Mapping(map) => map
+            .iter()
+            .any(|(key, value)| (is_short_id(key) && matches!(value, Value::Number(_))) || has_numeric_short_id(value)),
+        Value::Sequence(seq) => seq.iter().any(has_numeric_short_id),
+        _ => false,
+    }
+}
+
+fn same_except_short_id(old: &Value, new: &Value) -> bool {
+    match (old, new) {
+        (Value::Mapping(old), Value::Mapping(new)) => {
+            old.len() == new.len()
+                && old.iter().zip(new).all(|((key, old), (new_key, new))| {
+                    key == new_key
+                        && (same_except_short_id(old, new)
+                            || (is_short_id(key) && matches!((old, new), (Value::Number(_), Value::String(_)))))
+                })
+        }
+        (Value::Sequence(old), Value::Sequence(new)) => {
+            old.len() == new.len() && old.iter().zip(new).all(|(old, new)| same_except_short_id(old, new))
+        }
+        _ => old == new,
+    }
+}
+
+fn is_short_id(key: &Value) -> bool {
+    key.as_str() == Some("short-id")
+}
+
+pub async fn save_yaml<T: Serialize + Sync>(path: &Path, data: &T, prefix: Option<&str>) -> Result<()> {
+    let data_str = with_encryption(|| async { serde_yaml_ng::to_string(data) }).await?;
+
+    save_yaml_str(path, &data_str, prefix).await
+}
+
+/// Atomic replace with pre-serialized content; the payload must not need the encryption scope.
+pub async fn save_yaml_str(path: &Path, yaml_str: &str, prefix: Option<&str>) -> Result<()> {
+    let (temporary, file) = loop {
+        let temporary = path.with_extension(format!("tmp-{}-{}", std::process::id(), nanoid!()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to create temporary file \"{}\" for \"{}\"",
+                        temporary.display(),
+                        path.display()
+                    )
+                });
+            }
+        }
+    };
+
+    let temporary = DropGuard::new(temporary, |path| {
+        let _ = std::fs::remove_file(path);
+    });
+    let mut file = tokio::fs::File::from_std(file);
+    async fn write_chunk(file: &mut tokio::fs::File, bytes: &[u8], path: &Path) -> Result<()> {
+        file.write_all(bytes)
+            .await
+            .with_context(|| format!("failed to write temporary file for \"{}\"", path.display()))
+    }
+    if let Some(prefix) = prefix {
+        write_chunk(&mut file, prefix.as_bytes(), path).await?;
+        write_chunk(&mut file, b"\n\n", path).await?;
+    }
+    write_chunk(&mut file, yaml_str.as_bytes(), path).await?;
+    file.flush()
+        .await
+        .with_context(|| format!("failed to flush temporary file for \"{}\"", path.display()))?;
+    drop(file);
+
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            tokio::fs::set_permissions(temporary.as_path(), metadata.permissions())
+                .await
+                .with_context(|| format!("failed to preserve permissions for \"{}\"", path.display()))?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect file \"{}\"", path.display()));
+        }
+    }
+
+    std::fs::rename(temporary.as_path(), path)
+        .with_context(|| format!("failed to replace file \"{}\"", path.display()))?;
+    let _ = DropGuard::dismiss(temporary);
+    Ok(())
+}
+
+const ALPHABET: [char; 62] = [
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+    'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J',
+    'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
+];
+
+pub fn get_uid(prefix: &str) -> String {
+    let id = nanoid!(11, &ALPHABET);
+    format!("{prefix}{id}")
+}
+
+pub fn parse_str<T: FromStr>(target: &str, key: &str) -> Option<T> {
+    target.split(';').map(str::trim).find_map(|s| {
+        let mut parts = s.splitn(2, '=');
+        match (parts.next(), parts.next()) {
+            (Some(k), Some(v)) if k == key => v.parse::<T>().ok(),
+            _ => None,
+        }
+    })
+}
+
+pub fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[usize::from(byte >> 4)] as char);
+        out.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    out
+}
+
+/// Masks query values and token-like path segments for logging.
+pub fn mask_url(url: &str) -> String {
+    let (path_part, query_part) = match url.find('?') {
+        Some(pos) => (&url[..pos], Some(&url[pos + 1..])),
+        None => (url, None),
+    };
+
+    let host_end = path_part
+        .find("://")
+        .and_then(|scheme_end| {
+            path_part[scheme_end + 3..]
+                .find('/')
+                .map(|slash| scheme_end + 3 + slash)
+        })
+        .unwrap_or(path_part.len());
+
+    let scheme_and_host = &path_part[..host_end];
+    let path = &path_part[host_end..]; // starts with '/' or empty
+
+    let mut result = scheme_and_host.to_owned();
+
+    if !path.is_empty() {
+        let masked: Vec<&str> = path
+            .split('/')
+            .map(|seg| if seg.len() > 16 { "***" } else { seg })
+            .collect();
+        result.push_str(&masked.join("/"));
+    }
+
+    if let Some(query) = query_part {
+        result.push('?');
+        let masked_query: Vec<String> = query
+            .split('&')
+            .map(|param| match param.find('=') {
+                Some(eq) => format!("{}=***", &param[..eq]),
+                None => param.to_owned(),
+            })
+            .collect();
+        result.push_str(&masked_query.join("&"));
+    }
+
+    result
+}
+
+/// Masks every HTTP(S) URL embedded in a log string while preserving surrounding text.
+pub fn mask_err(err: &str) -> String {
+    let mut result = String::with_capacity(err.len());
+    let mut remaining = err;
+
+    loop {
+        let http = remaining.find("http://");
+        let https = remaining.find("https://");
+        let start = match (http, https) {
+            (None, None) => {
+                result.push_str(remaining);
+                break;
+            }
+            (Some(a), None) | (None, Some(a)) => a,
+            (Some(a), Some(b)) => a.min(b),
+        };
+
+        result.push_str(&remaining[..start]);
+        remaining = &remaining[start..];
+
+        let url_end = remaining
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '"' | '\''))
+            .unwrap_or(remaining.len());
+
+        result.push_str(&mask_url(&remaining[..url_end]));
+        remaining = &remaining[url_end..];
+    }
+
+    result
+}
+
+pub fn get_last_part_and_decode(url: &str) -> Option<String> {
+    let path = url.split('?').next().unwrap_or("");
+    let segments: Vec<&str> = path.split('/').collect();
+    let last_segment = segments.last()?;
+
+    Some(
+        percent_encoding::percent_decode_str(last_segment)
+            .decode_utf8_lossy()
+            .to_string(),
+    )
+}
+
+pub fn open_file(path: PathBuf) -> Result<()> {
+    open::that_detached(path.as_os_str())?;
+    Ok(())
+}
+
+pub fn open_latest_log(path: PathBuf) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    let path = snapshot_path(&path)?;
+    open_file(path)
+}
+
+pub fn open_app_latest_log() -> Result<()> {
+    let path = crate::utils::dirs::app_latest_log()?;
+    open_latest_log(path)
+}
+
+pub async fn open_core_latest_log() -> Result<()> {
+    let path = if matches!(
+        *crate::core::CoreManager::global().get_running_mode(),
+        crate::core::manager::RunningMode::Service
+    ) {
+        let path = crate::utils::dirs::service_log_dir()?.join("service_latest.log");
+        let snapshot = crate::core::service::get_clash_log_snapshot_by_service().await?;
+        tokio::fs::write(&path, snapshot).await?;
+        path
+    } else {
+        crate::utils::dirs::clash_latest_log()?
+    };
+    open_latest_log(path)
+}
+
+#[cfg(target_os = "linux")]
+pub fn linux_elevator() -> String {
+    use std::process::Command;
+    match Command::new("which").arg("pkexec").output() {
+        Ok(output) => {
+            if !output.stdout.is_empty() {
+                if let Ok(path) = std::str::from_utf8(&output.stdout) {
+                    path.trim().to_string()
+                } else {
+                    "sudo".to_string()
+                }
+            } else {
+                "sudo".to_string()
+            }
+        }
+        Err(_) => "sudo".to_string(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn snapshot_path(original_path: &Path) -> Result<PathBuf> {
+    let temp_dir = original_path
+        .parent()
+        .ok_or_else(|| anyhow!("Invalid log path"))?
+        .join("temp");
+
+    std::fs::create_dir_all(&temp_dir).map_err(|error| {
+        anyhow!(
+            "failed to create log snapshot directory {}: {error}",
+            temp_dir.display()
+        )
+    })?;
+
+    let temp_path = temp_dir.join(format!(
+        "{}_{}.log",
+        original_path.file_stem().unwrap_or_default().to_string_lossy(),
+        chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+    ));
+
+    std::fs::copy(original_path, &temp_path).map_err(|error| {
+        anyhow!(
+            "failed to copy log snapshot from {} to {}: {error}",
+            original_path.display(),
+            temp_path.display()
+        )
+    })?;
+
+    Ok(temp_path)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, reason = "tests assert by panicking")]
+mod tests {
+    use super::{parse_mapping, parse_short_id_text};
+    use serde_yaml_ng::Value;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn plain_short_id_stays_text() {
+        let profile = "\
+proxies:
+  - name: a
+    reality-opts:
+      short-id: 1234e123
+  - {name: b, reality-opts: {public-key: k, short-id: 0e5}}
+";
+        let mapping = parse_mapping(profile.into(), PathBuf::from("profile.yaml")).expect("profile should parse");
+        let output = serde_yaml_ng::to_string(&mapping).expect("mapping should serialize");
+        assert!(output.contains("short-id: '1234e123'"), "{output}");
+        assert!(output.contains("short-id: '0e5'"), "{output}");
+    }
+
+    #[test]
+    fn short_id_quoting_changing_other_values_is_dropped() {
+        let profile = "\
+proxies:
+  - name: a
+    reality-opts:
+      short-id: 1234e123
+note: |
+  short-id: 1234e123
+";
+        let today = serde_yaml_ng::from_str::<Value>(profile).expect("profile should parse");
+        let value = parse_short_id_text(profile, Path::new("profile.yaml")).expect("profile should parse");
+        assert_eq!(value, today);
+    }
+}
