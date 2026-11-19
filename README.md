@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="../src-tauri/icons/icon.png" alt="Clash" width="128" />
+  <img src="src-tauri/icons/icon.png" alt="Clash" width="128" />
   <br>
   Continuation of <a href="https://github.com/zzzgydi/clash-verge">Clash Verge</a>
   <br>
@@ -13,7 +13,7 @@ A Clash Meta GUI built with <a href="https://github.com/tauri-apps/tauri">Tauri<
 
 | Dark                                | Light                                 |
 | ----------------------------------- | ------------------------------------- |
-| ![Dark Preview](./preview_dark.png) | ![Light Preview](./preview_light.png) |
+| ![Dark Preview](preview_dark.png) | ![Light Preview](preview_light.png) |
 
 ## Install
 
@@ -40,7 +40,7 @@ Visit the [Release page](https://github.com/BailiffNippers/clash-verge-rev/relea
 
 ## Development
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md) for detailed contribution guidelines.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed contribution guidelines.
 
 After installing all **Tauri** prerequisites, run the development shell with:
 
@@ -65,11 +65,6 @@ Clash Verge Rev builds on or draws inspiration from these projects:
 - [Fndroid/clash_for_windows_pkg](https://github.com/Fndroid/clash_for_windows_pkg): A Clash GUI for Windows and macOS.
 - [vitejs/vite](https://github.com/vitejs/vite): Next-generation frontend tooling with blazing-fast DX.
 
-## Privacy
-
-Clash Verge Rev does not collect any user data; configuration and logs stay on
-your own device. See the [Privacy Policy](../PRIVACY.md) for details.
-
 ## License
 
-GPL-3.0 License. See the [license file](../LICENSE) for details.
+GPL-3.0 License. See the [license file](LICENSE) for details.
