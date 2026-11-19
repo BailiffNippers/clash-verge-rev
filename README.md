@@ -23,7 +23,7 @@ Visit the [Release page](https://github.com/BailiffNippers/clash-verge-rev/relea
 |----------|--------------|------|----------|
 | **Windows** | x86_64 | `Clash.Verge_2.5.10_x64_86-setup.zip` | [⬇ Download](https://github.com/BailiffNippers/clash-verge-rev/releases/download/v2.5.10/Clash.Verge_2.5.10_x64_86-setup.zip) |
 | **Linux** | aarch64 (ARM64) | `Clash.Verge_2.5.10_arm64.deb` | [⬇ Download](https://github.com/BailiffNippers/clash-verge-rev/releases/download/v2.5.10/Clash.Verge_2.5.10_arm64.deb) |
-| **Linux** | x86_64 (AMD64) | `lichii-linux-x86_64.AppImage` | [⬇ Download](https://github.com/BailiffNippers/clash-verge-rev/releases/download/v2.5.10/Clash.Verge_2.5.10_amd64.deb) |
+| **Linux** | x86_64 (AMD64) | `Clash.Verge_2.5.10_amd64.deb` | [⬇ Download](https://github.com/BailiffNippers/clash-verge-rev/releases/download/v2.5.10/Clash.Verge_2.5.10_amd64.deb) |
 | **macOS** | aarch64 (Apple Silicon) | `Clash.Verge_2.5.10_aarch64.dmg` | [⬇ Download](https://github.com/BailiffNippers/clash-verge-rev/releases/download/v2.5.10/Clash.Verge_2.5.10_aarch64.dmg) |
 
 **Installation:** Download and extract the archive, then run `Clash.Verge_2.5.10_x64_86-setup.exe` (Windows).
